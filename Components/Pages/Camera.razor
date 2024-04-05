@@ -1,0 +1,231 @@
+@page "/"
+@rendermode InteractiveServer
+@inject IJSRuntime JS
+@inherits LayoutComponentBase
+@using Core;
+
+<PageTitle>Pesada Hacienda</PageTitle>
+
+<div class="column">
+    @if (_camera.Frame != null)
+    {
+        <div class="center" id="frame-wrapper" style="width:960px;" @ref=_frameRef>
+            <img src=@_camera.Frame style="width: 100%; height:540px; border: 3px solid var(--color-shadow, currentColor);"
+                @ref=_imgRef />
+        </div>
+    }
+    else if (_cameraFailed)
+    {
+        <div class="center-error">
+            <label>No se puede acceder a la camara</label>
+            <button class="buttonload" @onclick="Retry">
+                <i class="@(_retrying? "fa fa-circle-o-notch fa-spin" : "hidden")" /> Reintentar
+            </button>
+        </div>
+    }
+
+    <div class="card">
+        <div class="input_grid">
+            <form style="display: flex; justify-content: flex-start; align-items: center; gap: 5px">
+                <label>Zoom:</label>
+                <input id="stream-size" type="range" min="960" max="1920" step="1" @bind="Size" />
+            </form>
+
+            <form style="display: flex; justify-content: flex-start; align-items: center; gap: 5px">
+                <label>Mejor Calidad:</label>
+                <label class="switch">
+                    <input type="checkbox" @onchange="eventArgs => SwitchQuality((bool) (eventArgs.Value ?? false))">
+                    <span class="slider round"></span>
+                </label>
+            </form>
+        </div>
+
+        <div class="input_grid">
+            <label class="input" id="kilos">
+                <input class="input__field" type="number" placeholder="" @bind="Kilos" />
+                <span class="input__label">Peso en Kg</span>
+            </label>
+            
+            <label class="input" id="tropa">
+                <input class="input__field" type="number" placeholder="" @bind="Tropa" />
+                <span class="input__label">Tropa</span>
+            </label>
+        </div>
+
+        <button @onclick="Post" disabled="@_disablePost">
+            <i class="@(_posting? "fa fa-circle-o-notch fa-spin" : "hidden")" /> Confirmar
+        </button>
+    </div>
+</div>
+
+<Modal IsServiceModal="true" UseStaticBackdrop="true" CloseOnEscape="false" />
+<Toasts class="p-3" Messages="_messages" Placement="ToastsPlacement.TopRight" AutoHide="true" />
+
+@code {
+    // 1000 ms / Cantidad de frames por segundo
+    private const int FPS = 1000 / 15;
+
+    private ElementReference _frameRef;
+    private ElementReference _imgRef;
+
+    [Inject] private ModalService _modalService { get; set; } = default!;
+    private List<ToastMessage> _messages = new();
+
+    private AzureBlobStorage _azure = new();
+    private CameraAPI _camera = new();
+    private SqlClient _sql = new();
+
+    private bool _retrying = false;
+    private bool _disablePost = true;
+    private bool _cameraFailed = false;
+    private bool _posting = false;
+
+    private int _size;
+    public int Size
+    {
+        get => _size;
+        set
+        {
+            _size = value;
+            var _ = JS.InvokeVoidAsync("setFrameWidth", _frameRef, _size);
+            var __ = JS.InvokeVoidAsync("setImgHeight", _imgRef, _size);
+        }
+    }
+
+    private int? _kilos;
+    public int? Kilos
+    {
+        get => _kilos;
+        set
+        {
+            _kilos = value;
+            if (_kilos != null && _tropa != null && !_cameraFailed)
+            {
+                _disablePost = false;
+                StateHasChanged();
+            }
+        }
+    }
+
+    private int? _tropa;
+    public int? Tropa
+    {
+        get => _tropa;
+        set
+        {
+            _tropa = value;
+            if (_kilos != null && _tropa != null && !_cameraFailed)
+            {
+                _disablePost = false;
+                StateHasChanged();
+            }
+        }
+    }
+
+    // Se ejecuta al cargar la pagina
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+
+        if (!_cameraFailed)
+        {
+            _cameraFailed = !await _camera.InitStreams();
+        }
+    }
+
+    // Se ejecuta al terminar de cargar la pagina
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        await base.OnAfterRenderAsync(firstRender);
+
+        if (_cameraFailed)
+        {
+            return;
+        }
+
+        await InvokeAsync(async () =>
+        {
+            _camera.ReadFrame();
+            // Delay entre frame y frame, ideal para evitar sobre cargar al cliente.
+            await Task.Delay(FPS);
+            StateHasChanged();
+        });
+    }
+
+    public async Task SwitchQuality(bool highQuality)
+    {
+        if (highQuality)
+        {
+            await _camera.InitStreams(quality: CameraAPI.StreamQuality.High);
+        }
+        else
+        {
+            await _camera.InitStreams(quality: CameraAPI.StreamQuality.Low);
+        }
+    }
+
+    public async Task Retry()
+    {
+        _retrying = true;
+        _cameraFailed = !await _camera.InitStreams();
+        if (_kilos != null && _tropa != null && !_cameraFailed)
+        {
+            _disablePost = false;
+            StateHasChanged();
+        }
+    }
+
+    public async Task Post()
+    {
+        if (_posting)
+        {
+            return;
+        }
+
+        _posting = true;
+        _disablePost = true;
+        StateHasChanged();
+
+        try
+        {
+            SavedFrame frame = _camera.SaveFrame() ?? throw new Exception("No se pudo capturar la imagen");
+
+            if ((Kilos.HasValue && Kilos <= 0) || (Tropa.HasValue && Tropa.Value <= 0))
+            {
+                _messages.Add(new ToastMessage
+                    {
+                        Type = ToastType.Warning,
+                        Message = $"El campo {(Kilos == 0? "Kilos" : "Tropa")} no puede ser menor o igual a 0"
+                    });
+            }
+            else if (Kilos.HasValue && Tropa.HasValue)
+            {
+                await _sql.Post(frame.Name, Kilos.Value, Tropa.Value);
+                var resp = await _azure.UploadFrame(frame);
+
+                var modalOption = new ModalOption
+                    {
+                        Title = "Listo!",
+                        Message = "Se registro exitosamente.",
+                        Type = ModalType.Success,
+                    };
+                await _modalService.ShowAsync(modalOption);
+            }
+        }
+        catch (Exception ex)
+        {
+            var modalOption = new ModalOption
+            {
+                Title = "Error! Por favor, comunicarse con Sistemas con una captura del siguente error",
+                Message = $"{ex.Message}.",
+                Type = ModalType.Danger,
+                Size = ModalSize.Large
+            };
+            await _modalService.ShowAsync(modalOption);
+        }
+
+        _posting = false;
+        _disablePost = false;
+        StateHasChanged();
+    }
+}
